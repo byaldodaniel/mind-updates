@@ -1,0 +1,49 @@
+name: Piloto de plataformas Mind
+
+on:
+  push:
+    branches:
+      - codex/piloto-paridad
+
+permissions: {}
+
+jobs:
+  verificar:
+    name: ${{ matrix.nombre }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { nombre: Windows x64, runner: windows-2025, sistema: Windows, arch: x64 }
+          - { nombre: Linux x64, runner: ubuntu-24.04, sistema: Linux, arch: x86_64 }
+          - { nombre: Linux ARM64, runner: ubuntu-24.04-arm, sistema: Linux, arch: aarch64 }
+          - { nombre: macOS Apple Silicon, runner: macos-15, sistema: Darwin, arch: arm64 }
+          - { nombre: macOS Intel, runner: macos-15-intel, sistema: Darwin, arch: x86_64 }
+    env:
+      MIND_ESPERADO_SISTEMA: ${{ matrix.sistema }}
+      MIND_ESPERADA_ARQUITECTURA: ${{ matrix.arch }}
+    steps:
+      - name: Verificar Windows y su arquitectura
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
+          if ($env:RUNNER_OS -ne $env:MIND_ESPERADO_SISTEMA -or $architecture -ne $env:MIND_ESPERADA_ARQUITECTURA) {
+            throw "Entorno inesperado: $env:RUNNER_OS $architecture"
+          }
+          Write-Output "$env:RUNNER_OS $architecture"
+
+      - name: Verificar el sistema y su arquitectura
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -eu
+          system="$(uname -s)"
+          architecture="$(uname -m)"
+          if [ "$system" != "$MIND_ESPERADO_SISTEMA" ] || [ "$architecture" != "$MIND_ESPERADA_ARQUITECTURA" ]; then
+            printf 'Entorno inesperado: %s %s\n' "$system" "$architecture" >&2
+            exit 1
+          fi
+          printf '%s %s\n' "$system" "$architecture"
