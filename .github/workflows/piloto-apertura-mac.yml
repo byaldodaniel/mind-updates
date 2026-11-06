@@ -1,4 +1,4 @@
-name: Conexión MCP Mac tras descarga de Mind 1.0.2
+name: Primer uso Mac del ZIP universal de Mind 1.0.2
 
 on:
   push:
@@ -13,27 +13,27 @@ jobs:
   primera-apertura:
     if: github.actor == 'byaldodaniel' && github.triggering_actor == 'byaldodaniel'
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 6
+    timeout-minutes: 12
     permissions:
       contents: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { runner: macos-15, arch: arm64, filename: Mind-1.0.2-darwin-arm64.tar.gz, id: '715574386', bytes: '65742327', sha256: '351afc2e75fb192d3dd01328ce91d4d01275a7a17cdf7935b51b20b5dc8a7042' }
-          - { runner: macos-15-intel, arch: x86_64, filename: Mind-1.0.2-darwin-x64.tar.gz, id: '715574397', bytes: '66507780', sha256: '9c1b35103d301cdd759c46393e40c86375fe681b277d825d5daf1422d919a897' }
+          - { runner: macos-15, arch: arm64 }
+          - { runner: macos-15-intel, arch: x86_64 }
     env:
-      ASSET: ${{ matrix.filename }}
-      EXPECTED: ${{ matrix.sha256 }}
-      EXPECTED_BYTES: ${{ matrix.bytes }}
+      ASSET: Mind-1.0.2-universal.zip
+      EXPECTED: '9d7df9031f066c3bd2529ec66848e22c3dd8e1c464811933f78a0f45b60f27ce'
+      EXPECTED_BYTES: '440195527'
       EXPECTED_ARCH: ${{ matrix.arch }}
     steps:
-      - name: Obtener solo el candidato de este destino desde el borrador
+      - name: Obtener acceso temporal al único ZIP del borrador
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_ID: '436019600'
-          ASSET_ID: ${{ matrix.id }}
+          RELEASE_ID: '436562820'
+          DRAFT_TAG: 'codex-validacion-universal-1b42e12'
         run: |
           set -euo pipefail
           umask 077
@@ -41,37 +41,40 @@ jobs:
           mkdir -m 700 "$private"
           mkdir "$RUNNER_TEMP/mind-gui-evidence"
           gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$private/release.json"
-          jq -e --argjson id "$ASSET_ID" --arg name "$ASSET" --arg hash "$EXPECTED" \
-            '.draft == true and .tag_name == "codex-validacion-1.0.2-1f2c6d9" and
-             ([.assets[] | select(.id == $id and .name == $name and .digest == ("sha256:" + $hash))] | length == 1)' \
-            "$private/release.json" >/dev/null
-          if ! curl --silent --fail --location --max-redirs 3 --max-time 90 \
-            --proto '=https' --proto-redir '=https' \
-            -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/octet-stream' \
-            -D "$private/headers" -o "$private/$ASSET" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$ASSET_ID"; then
-            printf 'No se pudo descargar el candidato del borrador.\n' >&2
+          asset_id="$(jq -er --arg tag "$DRAFT_TAG" --arg name "$ASSET" --arg hash "$EXPECTED" \
+            --argjson bytes "$EXPECTED_BYTES" '
+              if .draft != true or .tag_name != $tag then error("Borrador inesperado") else
+                [.assets[] | select(.name == $name and .digest == ("sha256:" + $hash) and .size == $bytes)] |
+                if length == 1 then .[0].id else error("Activo ambiguo o de huella distinta") end
+              end' "$private/release.json")"
+          if ! status="$(curl --silent --fail --max-time 30 --max-filesize 1024 \
+            --proto '=https' -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/octet-stream' \
+            -D "$private/headers" -o /dev/null -w '%{http_code}' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$asset_id")" || [[ "$status" != 302 ]]; then
+            printf 'resultado=no_verificado; motivo=GitHub no entregó la redirección HTTPS del candidato.\n'
             exit 1
           fi
-          printf '%s  %s\n' "$EXPECTED" "$private/$ASSET" | shasum -a 256 -c - >/dev/null
-          python3 - "$private" <<'PY'
+          python3 -I -B - "$private" <<'PY'
           from pathlib import Path
           from sys import argv
           from urllib.parse import urlsplit
 
           folder = Path(argv[1])
           for line in (folder / 'headers').read_text(encoding='iso-8859-1').splitlines():
-              if line.lower().startswith('location:'):
-                  value = line.split(':', 1)[1].strip()
-                  url = urlsplit(value)
-                  if (url.scheme == 'https' and url.hostname in {
-                      'release-assets.githubusercontent.com', 'objects.githubusercontent.com',
-                  } and not url.username and not url.password and url.query):
-                      (folder / 'redirect').write_text(value, encoding='ascii')
-                      break
+              if not line.lower().startswith('location:'):
+                  continue
+              value = line.split(':', 1)[1].strip()
+              url = urlsplit(value)
+              if (url.scheme == 'https' and url.hostname in {
+                  'release-assets.githubusercontent.com', 'objects.githubusercontent.com',
+              } and not url.username and not url.password and url.query):
+                  (folder / 'redirect').write_text(value, encoding='ascii')
+                  break
+          else:
+              raise SystemExit('resultado=no_verificado; motivo=destino HTTPS inesperado.')
           PY
           rm "$private/headers" "$private/release.json"
-          printf 'Activo exacto del borrador verificado por SHA-256.\n'
+          printf 'activo_del_borrador=verificado_por_nombre_tamaño_y_huella\n'
 
       - name: Descargar, extraer y verificar la conexión MCP en Mac
         shell: bash
@@ -122,7 +125,7 @@ jobs:
           unset url
           trap 'kill -TERM "$browser" 2>/dev/null || true' EXIT
           has_quarantine() { /usr/bin/xattr -p com.apple.quarantine "$1" >/dev/null 2>&1; }
-          for (( i = 0; i < 60; i++ )); do
+          for (( i = 0; i < 150; i++ )); do
             if [[ -f "$archive" ]] && [[ "$(stat -f %z "$archive")" == "$EXPECTED_BYTES" ]] \
               && has_quarantine "$archive"; then break; fi
             if ! kill -0 "$browser" 2>/dev/null; then break; fi
@@ -157,6 +160,8 @@ jobs:
 
           root = Path(argv[1]).resolve()
           arch = 'x64' if argv[2] == 'x86_64' else argv[2]
+          target = 'darwin-' + arch
+          targets = {'win32-x64', 'darwin-x64', 'darwin-arm64', 'linux-x64', 'linux-arm64'}
           for glob in ('*/mind-producto.json', '*/*/mind-producto.json'):
               for manifest in root.glob(glob):
                   if not manifest.resolve().is_relative_to(root):
@@ -165,16 +170,20 @@ jobs:
                       data = json.loads(manifest.read_text(encoding='utf-8'))
                   except (OSError, ValueError):
                       continue
-                  if data.get('mindVersion') == '1.0.2' and data.get('platform') == 'darwin' and data.get('arch') == arch:
-                      if (manifest.parent / 'Autorizar Mind.command').is_file():
-                          print(manifest.parent)
-                          raise SystemExit(0)
+                  if (data.get('mindVersion') == '1.0.2'
+                      and data.get('builtFrom') == '1b42e120d529a923f991988a79d1e92b316a947f'
+                      and set(data.get('targets', [])) == targets
+                      and (manifest.parent / 'mind').is_file()
+                      and (manifest.parent / 'Runtime' / target / 'node/bin/node').is_file()
+                      and (manifest.parent / 'Runtime' / target / 'python/bin/python3').is_file()):
+                      print(manifest.parent)
+                      raise SystemExit(0)
           raise SystemExit(1)
           PY
           }
 
           test_connection() {
-            "$python" -I -B - "$product" "$private/fixture" <<'PY'
+            "$python" -I -B - "$product" "$private/fixture" "$EXPECTED_ARCH" <<'PY'
           import json
           import os
           from pathlib import Path
@@ -183,28 +192,53 @@ jobs:
           import sys
           import time
 
-          root, fixture = map(Path, sys.argv[1:])
+          root, fixture = map(Path, sys.argv[1:3])
+          arch = 'x64' if sys.argv[3] == 'x86_64' else sys.argv[3]
+          runtime = Path('Runtime') / ('darwin-' + arch)
+          node = runtime / 'node/bin/node'
+          python = runtime / 'python/bin/python3'
+          launcher = root / 'mind'
+          configuration = root / '.mcp.json'
           fixture.mkdir()
+          empty_path = fixture / 'sin-programas'
+          empty_path.mkdir()
           note = 'contenido-ficticio-apertura-mac'
           (fixture / 'nota.txt').write_text(note, encoding='utf-8')
-          manifest = json.loads((root / 'mind-producto.json').read_text(encoding='utf-8'))
-          config = json.loads((root / '.mcp.json').read_text(encoding='utf-8'))['mcpServers']['mind']
-          expected_node = next(item['version'] for item in manifest['components'] if item['name'] == 'node')
-          environment = {key: value for key, value in os.environ.items() if key not in {
-              'MIND_BASE', 'MIND_PYTHON', 'NODE_OPTIONS', 'GH_TOKEN', 'GITHUB_TOKEN',
-          }}
-          environment.update(config.get('env', {}))
-          runtime = str(root / config['command'])
-          runtime_version = subprocess.run(
-              [runtime, '--version'], cwd=root, env=environment, capture_output=True, timeout=20,
-          )
-          if runtime_version.returncode != 0 or runtime_version.stdout.decode().strip() != 'v' + expected_node:
+          if configuration.exists() or (root / 'Base').exists() or not os.access(launcher, os.X_OK):
               raise SystemExit(1)
-          print('runtime_node=version_declarada', flush=True)
+          environment = {key: value for key, value in os.environ.items() if key.upper() not in {
+              'PATH', 'MIND_BASE', 'MIND_PYTHON', 'NODE_OPTIONS', 'NODE_PATH', 'GH_TOKEN', 'GITHUB_TOKEN',
+              'PYTHONHOME', 'PYTHONPATH',
+          }}
+          # Mantiene fijos los bytes descargados. La actualización se prueba en la matriz.
+          environment.update({'PATH': str(empty_path), 'MIND_UPDATE_RESTART': '1'})
+
+          def quarantine(file):
+              outcome = subprocess.run(
+                  ['/usr/bin/xattr', '-p', 'com.apple.quarantine', file],
+                  capture_output=True, timeout=8,
+              )
+              return outcome.stdout if outcome.returncode == 0 else None
+
+          active_before = quarantine(root / python)
+          inactive = root / 'Runtime/node/node.exe'
+          inactive_before = quarantine(inactive)
+          print('cuarentena_python_antes=' + ('presente' if active_before is not None else 'ausente'), flush=True)
+          prepared = subprocess.run(
+              ['./mind', 'preparar'], cwd=root, env=environment, capture_output=True, timeout=40,
+          )
+          if prepared.returncode != 0 or (root / 'Base').exists():
+              raise SystemExit(1)
+          print('iniciador_preparar=superado', flush=True)
+          config = json.loads(configuration.read_text(encoding='utf-8'))['mcpServers']['mind']
+          if config['command'] != node.as_posix() or config['args'] != ['Motor/bin/mind.js', 'mcp']:
+              raise SystemExit(1)
+          print('mcp_config_nativa=superada', flush=True)
+          environment.update(config.get('env', {}))
           process = subprocess.Popen(
-              [runtime, *config['args'], '--carpeta', str(fixture)],
+              [str(root / node), *config['args'], '--carpeta', str(fixture)],
               cwd=root, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-              stderr=subprocess.DEVNULL,
+              stderr=subprocess.DEVNULL, bufsize=0,
           )
           try:
               def send(message):
@@ -212,7 +246,7 @@ jobs:
                   process.stdin.flush()
 
               def result(request_id):
-                  deadline = time.monotonic() + 40
+                  deadline = time.monotonic() + 55
                   while (remaining := deadline - time.monotonic()) > 0:
                       if not select.select([process.stdout], [], [], remaining)[0]:
                           break
@@ -228,24 +262,45 @@ jobs:
                   'protocolVersion': '2025-03-26', 'capabilities': {},
                   'clientInfo': {'name': 'cliente-ficticio-piloto', 'version': '1.0'},
               }})
-              if result(1).get('serverInfo', {}).get('name') != 'mind':
+              info = result(1).get('serverInfo', {})
+              if (info.get('name'), info.get('version')) != ('mind', '1.0.2'):
                   raise SystemExit(1)
               print('conexion_mcp=superada', flush=True)
               send({'method': 'notifications/initialized'})
               send({'id': 2, 'method': 'tools/call', 'params': {
+                  'name': 'estado', 'arguments': {},
+              }})
+              state = result(2).get('structuredContent', {}).get('mind', {})
+              executables = state.get('runtime', {})
+              if (state.get('motor') != '1.0.2'
+                  or Path(executables.get('node', '')).resolve() != (root / node).resolve()
+                  or Path(executables.get('python', '')).resolve() != (root / python).resolve()):
+                  raise SystemExit(1)
+              print('runtimes_nativos=superados', flush=True)
+              send({'id': 3, 'method': 'tools/call', 'params': {
                   'name': 'leer', 'arguments': {'ruta': 'nota.txt'},
               }})
-              read = result(2)
-              if read.get('isError') or note not in json.dumps(read):
+              read = result(3)
+              if read.get('isError') or read.get('structuredContent', {}).get('contenido') != note:
                   raise SystemExit(1)
               print('lectura_ficticia=superada', flush=True)
           finally:
               process.stdin.close()
               try:
-                  process.wait(timeout=4)
+                  process.wait(timeout=10)
               except subprocess.TimeoutExpired:
                   process.terminate()
-                  process.wait(timeout=4)
+                  process.wait(timeout=10)
+          if process.returncode != 0:
+              raise SystemExit(1)
+          print('cierre_mcp=superado', flush=True)
+          if quarantine(inactive) != inactive_before:
+              raise SystemExit(1)
+          if active_before is not None and quarantine(root / python) is not None:
+              raise SystemExit(1)
+          if active_before is not None:
+              print('cuarentena_python_activa=retirada_por_mind', flush=True)
+          print('cuarentena_runtime_inactivo=sin_cambios', flush=True)
           PY
           }
 
@@ -256,7 +311,7 @@ jobs:
             /usr/bin/open "$archive" >"$private/open-archive.log" 2>&1 || true
           fi
           product=''
-          for (( i = 0; i < 45; i++ )); do
+          for (( i = 0; i < 120; i++ )); do
             if product="$(detect_product 2>/dev/null)"; then break; fi
             product=''
             sleep 1
@@ -273,20 +328,20 @@ jobs:
             exit 1
           fi
           printf 'extraccion_launchservices=completada; cuarentena_iniciador=presente\n'
-          if has_quarantine "$product/Runtime/node/bin/node"; then printf 'cuarentena_runtime=presente\n'; fi
 
           if ! test_connection >"$private/mcp.log" 2>&1; then
-            grep -Ex 'runtime_node=version_declarada|conexion_mcp=superada|lectura_ficticia=superada' "$private/mcp.log" || true
+            grep -Ex 'iniciador_preparar=superado|mcp_config_nativa=superada|conexion_mcp=superada|runtimes_nativos=superados|lectura_ficticia=superada|cierre_mcp=superado|cuarentena_python_antes=(presente|ausente)|cuarentena_python_activa=retirada_por_mind|cuarentena_runtime_inactivo=sin_cambios' "$private/mcp.log" || true
             printf 'resultado=no_verificado; motivo=la prueba de runtime o MCP no terminó correctamente.\n'
             exit 1
           fi
-          grep -Ex 'runtime_node=version_declarada|conexion_mcp=superada|lectura_ficticia=superada' "$private/mcp.log"
-          printf 'resultado=superado; prueba=cliente MCP ficticio tras extracción natural, sin apertura de .command.\n'
+          grep -Ex 'iniciador_preparar=superado|mcp_config_nativa=superada|conexion_mcp=superada|runtimes_nativos=superados|lectura_ficticia=superada|cierre_mcp=superado|cuarentena_python_antes=(presente|ausente)|cuarentena_python_activa=retirada_por_mind|cuarentena_runtime_inactivo=sin_cambios' "$private/mcp.log"
+          spctl --status 2>&1 | grep -Fx 'assessments enabled'
+          printf 'resultado=superado; prueba=./mind preparar y cliente MCP ficticio tras descarga y extracción natural, sin abrir .command.\n'
       - name: Conservar únicamente evidencia de prueba
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: conexion-mcp-mac-${{ matrix.arch }}
+          name: primer-uso-zip-universal-mac-${{ matrix.arch }}
           path: ${{ runner.temp }}/mind-gui-evidence/
           retention-days: 1
           if-no-files-found: warn
