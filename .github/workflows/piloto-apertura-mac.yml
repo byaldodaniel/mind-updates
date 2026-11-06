@@ -73,7 +73,7 @@ jobs:
           rm "$private/headers" "$private/release.json"
           printf 'Activo exacto del borrador verificado por SHA-256.\n'
 
-      - name: Descargar con Chrome y observar la primera apertura de Finder
+      - name: Descargar con Chrome y observar la apertura mediante LaunchServices
         shell: bash
         run: |
           set -euo pipefail
@@ -92,91 +92,16 @@ jobs:
           printf 'SHA256=%s\n' "$EXPECTED"
 
           python="$(command -v python3 || true)"
-          if [[ -z "$python" || ! -x "$python" ]]; then
-            printf 'resultado=no_verificado; motivo=python3 no disponible para servir el archivo.\n'
-            exit 1
-          fi
-          cat > "$private/serve.py" <<'PY'
-          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-          from pathlib import Path
-          from shutil import copyfileobj
-          from sys import argv
-
-          folder = Path(argv[1])
-          asset = folder / argv[2]
-
-          class Handler(BaseHTTPRequestHandler):
-              def log_message(self, *_):
-                  pass
-
-              def do_GET(self):
-                  if self.path == '/salud':
-                      self.send_response(204)
-                      self.end_headers()
-                  elif self.path == '/candidato':
-                      (folder / 'get-candidato').touch()
-                      self.send_response(200)
-                      self.send_header('Content-Type', 'application/octet-stream')
-                      self.send_header('Content-Disposition', f'attachment; filename="{asset.name}"')
-                      self.send_header('Content-Length', str(asset.stat().st_size))
-                      self.end_headers()
-                      with asset.open('rb') as source:
-                          copyfileobj(source, self.wfile)
-                  elif self.path == '/respaldo' and (folder / 'redirect').is_file():
-                      (folder / 'get-respaldo').touch()
-                      self.send_response(302)
-                      self.send_header('Location', (folder / 'redirect').read_text(encoding='ascii'))
-                      self.send_header('Cache-Control', 'no-store')
-                      self.end_headers()
-                  else:
-                      self.send_error(404)
-
-          with ThreadingHTTPServer(('127.0.0.1', 0), Handler) as server:
-              pending = folder / 'port.tmp'
-              pending.write_text(f'{server.server_port}\n', encoding='ascii')
-              pending.replace(folder / 'port')
-              server.serve_forever()
-          PY
-          "$python" -I -B "$private/serve.py" "$private" "$ASSET" >"$private/servidor.log" 2>&1 &
-          server=$!
-          browser=''
-          cleanup() {
-            if [[ -n "$browser" ]]; then kill -TERM "$browser" 2>/dev/null || true; fi
-            kill "$server" 2>/dev/null || true
-          }
-          trap cleanup EXIT
-          port=''
-          for (( i = 0; i < 20; i++ )); do
-            if ! kill -0 "$server" 2>/dev/null; then
-              wait "$server" || true
-              printf 'resultado=no_verificado; motivo=el servidor local terminó antes de abrir el navegador.\n'
-              printf 'diagnostico_servidor=%s\n' "$(grep -Eo '^[A-Za-z]+(Error|Exception):' "$private/servidor.log" | tail -n 1 || true)"
-              exit 1
-            fi
-            if [[ -s "$private/port" ]]; then
-              IFS= read -r port < "$private/port" || true
-              if [[ "$port" =~ ^[0-9]+$ ]] && \
-                curl --silent --fail --max-time 2 --noproxy '*' "http://127.0.0.1:$port/salud" >/dev/null; then break; fi
-              port=''
-            fi
-            sleep 1
-          done
-          if [[ -z "$port" ]]; then
-            printf 'resultado=no_verificado; motivo=el servidor local no respondió al control de arranque.\n'
-            exit 1
-          fi
-          printf 'servidor_local=activo\n'
-
           chrome='/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
-          [[ -x "$chrome" ]]
-          has_quarantine() { /usr/bin/xattr -p com.apple.quarantine "$1" >/dev/null 2>&1; }
-          browser_download() {
-            local route="$1" profile="$private/chrome-$1" history size
-            local downloads="$HOME/Downloads/Mind-piloto-$1"
-            archive="$downloads/$ASSET"
-            product="$downloads/Mind"
-            mkdir -p "$profile/Default" "$downloads" || return 1
-            "$python" -I -B - "$profile" "$downloads" <<'PY' || return 1
+          if [[ -z "$python" || ! -x "$python" || ! -x "$chrome" || ! -s "$private/redirect" ]]; then
+            printf 'resultado=no_verificado; motivo=falta Python, Chrome o la redirección HTTPS temporal.\n'
+            exit 1
+          fi
+          downloads="$HOME/Downloads/Mind-piloto-https"
+          archive="$downloads/$ASSET"
+          profile="$private/chrome"
+          mkdir -p "$profile/Default" "$downloads"
+          "$python" -I -B - "$profile" "$downloads" <<'PY'
           import json
           from pathlib import Path
           from sys import argv
@@ -186,91 +111,144 @@ jobs:
               'download': {'default_directory': argv[2], 'prompt_for_download': False},
           }), encoding='utf8')
           PY
-            "$chrome" --user-data-dir="$profile" --no-first-run --no-default-browser-check \
-              "http://127.0.0.1:$port/$route" >"$private/chrome-$route.log" 2>&1 &
-            browser=$!
-            for (( i = 0; i < 50; i++ )); do
-              if [[ -f "$archive" ]] && [[ "$(stat -f %z "$archive")" == "$EXPECTED_BYTES" ]] \
-                && has_quarantine "$archive"; then break; fi
-              if ! kill -0 "$browser" 2>/dev/null; then break; fi
-              sleep 1
-            done
-            kill -TERM "$browser" 2>/dev/null || true
-            for (( i = 0; i < 12; i++ )); do
-              if ! kill -0 "$browser" 2>/dev/null; then break; fi
-              sleep 1
-            done
-            if kill -0 "$browser" 2>/dev/null; then
-              printf 'resultado=no_verificado; motivo=Chrome sigue abierto; no se captura la sesión.\n'
-              exit 1
-            fi
-            wait "$browser" || true
-            browser=''
-            if [[ -f "$private/get-$route" ]]; then
-              printf 'chrome_%s_peticion=observada\n' "$route"
-            else
-              printf 'chrome_%s_peticion=ausente\n' "$route"
-            fi
-            size=0
-            if [[ -f "$archive" ]]; then size="$(stat -f %z "$archive")"; fi
-            printf 'chrome_%s_archivo_bytes=%s\n' "$route" "$size"
-            history="$profile/Default/History"
-            if [[ -f "$history" ]]; then
-              row="$(/usr/bin/sqlite3 -readonly "$history" \
-                'SELECT state, danger_type, interrupt_reason FROM downloads ORDER BY id DESC LIMIT 1' 2>/dev/null || true)"
-              if [[ "$row" =~ ^[0-9]+\|[0-9]+\|[0-9]+$ ]]; then
-                printf 'chrome_%s_estado_peligro_interrupcion=%s\n' "$route" "$row"
-              fi
-            fi
-            [[ "$size" == "$EXPECTED_BYTES" ]] && has_quarantine "$archive"
-          }
-
-          method=loopback
-          if ! browser_download candidato; then
-            method=redirect-https
-            if [[ ! -s "$private/redirect" ]] || ! browser_download respaldo; then
-              printf 'resultado=no_verificado; motivo=Chrome no dejó el archivo completo con cuarentena natural.\n'
-              exit 1
-            fi
-          fi
-          printf '%s  %s\n' "$EXPECTED" "$archive" | shasum -a 256 -c - >/dev/null
-          printf 'descarga=chrome; transporte=%s; huella=coincide; cuarentena_archivo=presente\n' "$method"
-
-          open_finder() {
-            osascript - "$1" <<'APPLESCRIPT'
-          on run argv
-            with timeout of 8 seconds
-              set target to POSIX file (item 1 of argv) as alias
-              tell application id "com.apple.finder"
-                activate
-                open target
-              end tell
-            end timeout
-          end run
-          APPLESCRIPT
-          }
-          open_finder "$archive" >/dev/null 2>&1 &
-          unpack=$!
-          for (( i = 0; i < 45; i++ )); do
-            if [[ -f "$product/mind-producto.json" && -f "$product/Autorizar Mind.command" ]]; then break; fi
+          url="$(cat "$private/redirect")"
+          case "$url" in
+            https://release-assets.githubusercontent.com/*|https://objects.githubusercontent.com/*) ;;
+            *) echo 'resultado=no_verificado; motivo=destino HTTPS inesperado.'; exit 1 ;;
+          esac
+          "$chrome" --user-data-dir="$profile" --no-first-run --no-default-browser-check "$url" \
+            >"$private/chrome.log" 2>&1 &
+          browser=$!
+          unset url
+          trap 'kill -TERM "$browser" 2>/dev/null || true' EXIT
+          has_quarantine() { /usr/bin/xattr -p com.apple.quarantine "$1" >/dev/null 2>&1; }
+          for (( i = 0; i < 60; i++ )); do
+            if [[ -f "$archive" ]] && [[ "$(stat -f %z "$archive")" == "$EXPECTED_BYTES" ]] \
+              && has_quarantine "$archive"; then break; fi
+            if ! kill -0 "$browser" 2>/dev/null; then break; fi
             sleep 1
           done
-          wait "$unpack" || true
-          if [[ ! -f "$product/mind-producto.json" || ! -f "$product/Autorizar Mind.command" ]]; then
-            printf 'resultado=no_verificado; motivo=Finder no completó la extracción.\n'
+          kill -TERM "$browser" 2>/dev/null || true
+          for (( i = 0; i < 12; i++ )); do
+            if ! kill -0 "$browser" 2>/dev/null; then break; fi
+            sleep 1
+          done
+          if kill -0 "$browser" 2>/dev/null; then
+            printf 'resultado=no_verificado; motivo=Chrome sigue abierto; no se captura la sesión.\n'
             exit 1
           fi
-          printf 'extraccion=Finder; '
-          if has_quarantine "$product/Autorizar Mind.command"; then
-            printf 'cuarentena_iniciador=presente\n'
+          wait "$browser" || true
+          trap - EXIT
+          size=0
+          if [[ -f "$archive" ]]; then size="$(stat -f %z "$archive")"; fi
+          printf 'chrome_archivo_bytes=%s\n' "$size"
+          if [[ "$size" != "$EXPECTED_BYTES" ]] || ! has_quarantine "$archive"; then
+            printf 'resultado=no_verificado; motivo=Chrome no dejó el archivo completo con cuarentena natural.\n'
+            exit 1
+          fi
+          printf '%s  %s\n' "$EXPECTED" "$archive" | shasum -a 256 -c - >/dev/null
+          printf 'descarga=chrome; transporte=https; huella=coincide; cuarentena_archivo=presente\n'
+
+          detect_product() {
+            "$python" -I -B - "$downloads" "$EXPECTED_ARCH" <<'PY'
+          import json
+          from pathlib import Path
+          from sys import argv
+
+          root = Path(argv[1]).resolve()
+          arch = 'x64' if argv[2] == 'x86_64' else argv[2]
+          for glob in ('*/mind-producto.json', '*/*/mind-producto.json'):
+              for manifest in root.glob(glob):
+                  if not manifest.resolve().is_relative_to(root):
+                      continue
+                  try:
+                      data = json.loads(manifest.read_text(encoding='utf-8'))
+                  except (OSError, ValueError):
+                      continue
+                  if data.get('mindVersion') == '1.0.2' and data.get('platform') == 'darwin' and data.get('arch') == arch:
+                      if (manifest.parent / 'Autorizar Mind.command').is_file():
+                          print(manifest.parent)
+                          raise SystemExit(0)
+          raise SystemExit(1)
+          PY
+          }
+
+          assisted_connection() {
+            mkdir "$private/extraido-cli"
+            tar -xzf "$archive" -C "$private/extraido-cli" >"$private/tar.log" 2>&1 || return 1
+            "$python" -I -B - "$private/extraido-cli/Mind" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import select
+          import subprocess
+          import sys
+
+          root = Path(sys.argv[1])
+          config = json.loads((root / '.mcp.json').read_text(encoding='utf-8'))['mcpServers']['mind']
+          environment = {key: value for key, value in os.environ.items() if key not in {
+              'MIND_BASE', 'MIND_PYTHON', 'NODE_OPTIONS', 'GH_TOKEN', 'GITHUB_TOKEN',
+          }}
+          environment.update(config.get('env', {}))
+          process = subprocess.Popen(
+              [str(root / config['command']), *config['args']],
+              cwd=root, env=environment, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+              stderr=subprocess.DEVNULL,
+          )
+          try:
+              request = {'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {
+                  'protocolVersion': '2025-03-26', 'capabilities': {},
+                  'clientInfo': {'name': 'cliente-ficticio-piloto', 'version': '1.0'},
+              }}
+              process.stdin.write((json.dumps(request) + '\n').encode())
+              process.stdin.flush()
+              if not select.select([process.stdout], [], [], 35)[0]:
+                  raise SystemExit(1)
+              response = json.loads(process.stdout.readline())
+              if response.get('result', {}).get('serverInfo', {}).get('name') != 'mind':
+                  raise SystemExit(1)
+          finally:
+              process.stdin.close()
+              try:
+                  process.wait(timeout=4)
+              except subprocess.TimeoutExpired:
+                  process.terminate()
+                  process.wait(timeout=4)
+          PY
+          }
+
+          utility='/System/Library/CoreServices/Applications/Archive Utility.app'
+          if [[ -d "$utility" ]]; then
+            /usr/bin/open -a "$utility" "$archive" >"$private/open-archive.log" 2>&1 || true
           else
-            printf 'resultado=no_verificado; motivo=el iniciador extraído no tiene cuarentena natural.\n'
+            /usr/bin/open "$archive" >"$private/open-archive.log" 2>&1 || true
+          fi
+          product=''
+          for (( i = 0; i < 45; i++ )); do
+            if product="$(detect_product 2>/dev/null)"; then break; fi
+            product=''
+            sleep 1
+          done
+          if [[ -z "$product" ]]; then
+            printf 'extraccion_launchservices=no_completada\n'
+            if assisted_connection >"$private/mcp.log" 2>&1; then
+              printf 'extraccion_asistida=tar; cliente_MCP_de_prueba=conectado\n'
+            else
+              printf 'extraccion_asistida_o_cliente_MCP=no_verificado\n'
+            fi
+            printf 'resultado=no_verificado; motivo=LaunchServices no entregó la carpeta extraída.\n'
             exit 1
           fi
+          if ! has_quarantine "$product/Autorizar Mind.command"; then
+            printf 'extraccion_launchservices=completada; cuarentena_iniciador=ausente\n'
+            printf 'resultado=no_verificado; motivo=el iniciador extraído no conserva cuarentena natural.\n'
+            exit 1
+          fi
+          printf 'extraccion_launchservices=completada; cuarentena_iniciador=presente\n'
           if has_quarantine "$product/Runtime/node/bin/node"; then printf 'cuarentena_runtime=presente\n'; fi
 
           started="$(date '+%Y-%m-%d %H:%M:%S')"
-          open_finder "$product/Autorizar Mind.command" >/dev/null 2>&1 &
+          /usr/bin/open "$product/Autorizar Mind.command" >"$private/open-command.log" 2>&1 &
           first_launch=$!
           cat > "$private/window.js" <<'JXA'
           ObjC.import('CoreGraphics');
@@ -291,7 +269,9 @@ jobs:
               /usr/sbin/screencapture -x -l "$window_id" "$evidence/primera-apertura-$seconds.png" >/dev/null 2>&1 || true
             fi
           done
-          wait "$first_launch" || true
+          if kill -0 "$first_launch" 2>/dev/null; then kill -TERM "$first_launch" 2>/dev/null || true; fi
+          if wait "$first_launch"; then launch_status=0; else launch_status=$?; fi
+          printf 'apertura_launchservices_codigo=%s\n' "$launch_status"
           matches="$(/usr/bin/log show --start "$started" --info --style compact \
             --predicate 'process == "syspolicyd" OR process == "amfid"' 2>/dev/null \
             | grep -Eic 'Autorizar Mind|Gatekeeper|assessment|ticket not available|quarantine' || true)"
