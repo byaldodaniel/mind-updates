@@ -1,0 +1,364 @@
+name: Programador nativo con Mind cerrado
+on:
+  push:
+    branches:
+      - codex/piloto-paridad
+    paths:
+      - .github/workflows/piloto-programador.yml
+permissions: {}
+jobs:
+  programador:
+    name: ${{ matrix.plataforma }}
+    if: github.actor == 'byaldodaniel' && github.triggering_actor == 'byaldodaniel'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { plataforma: linux-x64, runner: ubuntu-24.04 }
+          - { plataforma: linux-arm64, runner: ubuntu-24.04-arm }
+          - { plataforma: darwin-arm64, runner: macos-15 }
+          - { plataforma: darwin-x64, runner: macos-15-intel }
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.22.1'
+      - name: Descargar el mismo ZIP del borrador de validación y comprobar su huella
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_PROMPT_DISABLED: '1'
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REPOSITORY" == 'byaldodaniel/mind-updates' ]]
+          repo="repos/$GITHUB_REPOSITORY"
+          sha=9d7df9031f066c3bd2529ec66848e22c3dd8e1c464811933f78a0f45b60f27ce
+          release="$(gh api "$repo/releases/436562820")"
+          jq -e --arg sha "$sha" '
+            .draft and .tag_name == "codex-validacion-universal-1b42e12" and
+            any(.assets[]; .id == 717341720 and .state == "uploaded" and
+                .name == "Mind-1.0.2-universal.zip" and .size == 440195527 and
+                .digest == ("sha256:" + $sha))
+          ' <<< "$release"
+          root="$(mktemp -d "$RUNNER_TEMP/mind-scheduler.XXXXXXXX")"
+          gh api --method GET -H 'Accept: application/octet-stream' \
+            "$repo/releases/assets/717341720" > "$root/Mind.zip"
+          (cd "$root" && printf '%s  Mind.zip\n' "$sha" | shasum -a 256 -c -)
+          unzip -q "$root/Mind.zip" -d "$root"
+          printf 'MIND_TEST_ROOT=%s\n' "$root" >> "$GITHUB_ENV"
+      - name: Confirmar que el programador nativo está disponible
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$(uname -s)" == Darwin ]]; then
+            launchctl print "gui/$(id -u)" >/dev/null
+          elif command -v crontab >/dev/null; then
+            sudo systemctl start cron
+            systemctl is-active cron
+          else
+            uid="$(id -u)"
+            sudo systemctl start "user@$uid.service"
+            export XDG_RUNTIME_DIR="/run/user/$uid"
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+            systemctl --user show-environment >/dev/null
+            printf 'XDG_RUNTIME_DIR=%s\nDBUS_SESSION_BUS_ADDRESS=%s\n' \
+              "$XDG_RUNTIME_DIR" "$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
+          fi
+      - name: Esperar el disparo nativo y comprobar ejecución, cierre y limpieza
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$MIND_TEST_ROOT/programador.mjs" <<'NODE'
+          import assert from 'node:assert/strict';
+          import { execFile as execFileCallback } from 'node:child_process';
+          import fs from 'node:fs/promises';
+          import os from 'node:os';
+          import path from 'node:path';
+          import { setTimeout as delay } from 'node:timers/promises';
+          import { pathToFileURL } from 'node:url';
+          import { promisify } from 'node:util';
+          
+          const execFile = promisify(execFileCallback);
+          const target = process.platform + '-' + process.arch;
+          const supported = ['darwin-arm64', 'darwin-x64', 'linux-arm64', 'linux-x64'];
+          assert.ok(supported.includes(target), 'Runner POSIX nativo requerido');
+          assert.equal(process.argv.length, 3, 'Uso: node probar-programador-posix.mjs <Mind extraído>');
+          const root = await fs.realpath(process.argv[2]);
+          const launcher = path.join(root, 'mind');
+          const motor = path.join(root, 'Motor');
+          const base = path.join(root, 'Base');
+          const installationFile = path.join(base, 'system-scheduler.json');
+          const manifestPath = path.join(root, 'mind-producto.json');
+          const functionId = 'prueba-programador-nativo';
+          const markerName = 'marca.txt';
+          const markerText = 'Mind: prueba ficticia del programador nativo';
+          const childEnv = { ...process.env, NODE_OPTIONS: '' };
+          for (const name of ['MIND_BASE', 'MIND_PYTHON', 'MIND_UPDATE_RESTART']) delete childEnv[name];
+          
+          async function readText(filename) {
+            try {
+              return await fs.readFile(filename, 'utf8');
+            } catch (error) {
+              if (error.code === 'ENOENT') return null;
+              throw error;
+            }
+          }
+          
+          async function readJson(filename) {
+            const contents = await readText(filename);
+            return contents === null ? null : JSON.parse(contents);
+          }
+          
+          async function run(file, args) {
+            try {
+              const result = await execFile(file, args, { cwd: root, env: childEnv, timeout: 65_000, maxBuffer: 2 * 1024 * 1024 });
+              return { code: 0, ...result };
+            } catch (error) {
+              return { code: error.code ?? error.signal ?? 1, stdout: error.stdout ?? '', stderr: error.stderr || error.message };
+            }
+          }
+          
+          function success(result, action) {
+            assert.equal(result.code, 0, action + ': ' + result.stderr.trim().slice(-500));
+            return result.stdout;
+          }
+          
+          const PTY = String.raw` 
+          import errno
+          import os
+          import pty
+          import select
+          import signal
+          import sys
+          import time
+          
+          pid, master = pty.fork()
+          if pid == 0:
+              os.execv(sys.argv[1], [sys.argv[1], 'programador', 'instalar'])
+          
+          transcript = b''
+          confirmed = False
+          deadline = time.monotonic() + 48
+          try:
+              while True:
+                  remaining = deadline - time.monotonic()
+                  if remaining <= 0:
+                      raise TimeoutError('El diálogo de instalación no terminó a tiempo')
+                  readable, _, _ = select.select([master], [], [], remaining)
+                  if not readable:
+                      continue
+                  try:
+                      data = os.read(master, 4096)
+                  except OSError as error:
+                      if error.errno != errno.EIO:
+                          raise
+                      break
+                  if not data:
+                      break
+                  transcript += data
+                  if not confirmed and b'Instalar el programador de Mind?' in transcript and b'[s/N]' in transcript:
+                      os.write(master, b's\n')
+                      confirmed = True
+          except BaseException:
+              try:
+                  os.kill(pid, signal.SIGTERM)
+              except ProcessLookupError:
+                  pass
+              raise
+          finally:
+              os.close(master)
+              _, status = os.waitpid(pid, 0)
+          
+          sys.stdout.buffer.write(transcript)
+          if not confirmed:
+              raise SystemExit('Mind no mostró el diálogo de instalación esperado')
+          sys.exit(os.waitstatus_to_exitcode(status))
+          `;
+          
+          const manifest = await readJson(manifestPath);
+          assert.equal(manifest?.mindVersion, '1.0.2');
+          assert.ok(manifest?.targets?.length === 5 && manifest.targets.includes(target), 'Se requiere el ZIP universal exacto');
+          assert.equal(await fs.lstat(base).then(() => true, error => error.code === 'ENOENT' ? false : Promise.reject(error)), false, 'Usar solo un paquete recién extraído y sin Base');
+          const version = JSON.parse(success(await run(launcher, ['version']), 'versión'));
+          assert.equal(version.plataforma, target);
+          assert.equal(version.mind, manifest.mindVersion);
+          const importMotor = (name) => import(pathToFileURL(path.join(motor, 'src', name)).href);
+          const { resolveLayout } = await importMotor('layout.js');
+          const { openSession, liveSessions } = await importMotor('session.js');
+          const { functionServiceFor } = await importMotor('automations/service.js');
+          const layout = await resolveLayout({ base, env: childEnv });
+          assert.ok(layout.product && layout.root === root, 'El programador debe usar el iniciador del producto extraído');
+          
+          const native = JSON.parse(success(await run(launcher, ['programador', 'estado']), 'detección del programador'));
+          assert.equal(native.instalado, false);
+          if (process.platform === 'darwin') {
+            assert.equal(native.disponible, 'launchd', 'Se requiere el dominio launchd de la sesión gráfica del runner');
+          } else if (native.disponible === 'crontab') {
+            success(await run('systemctl', ['is-active', '--quiet', 'cron.service']), 'cron.service debe estar activo en Ubuntu');
+          } else {
+            assert.equal(native.disponible, 'systemd', 'Se requiere cron activo o un gestor systemd de usuario');
+            success(await run('systemctl', ['--user', 'show-environment']), 'sesión de systemd --user');
+          }
+          console.log(JSON.stringify({ etapa: 'preflight', plataforma: target, programador: native.disponible }));
+          
+          async function processCount() {
+            const result = success(await run('ps', ['-ww', '-axo', 'pid=,command=']), 'lista de procesos');
+            return result.split('\n').filter(line => line.includes(path.join(motor, 'bin', 'mind.js')) || line.includes(path.join(layout.runtime.directory, 'python') + path.sep)).length;
+          }
+          
+          async function confirmClosed() {
+            const deadline = Date.now() + 30_000;
+            do {
+              const { live, stale } = await liveSessions(base);
+              if (live.length === 0 && stale.length === 0 && await processCount() === 0) return;
+              await delay(400);
+            } while (Date.now() < deadline);
+            throw new Error('Quedaron sesiones, registros de sesión o procesos del paquete de prueba');
+          }
+          
+          function nextDue() {
+            const now = new Date();
+            const due = new Date(now);
+            due.setSeconds(0, 0);
+            if (process.platform === 'darwin') {
+              due.setMinutes(due.getMinutes() + 2);
+            } else {
+              due.setMinutes(Math.floor(due.getMinutes() / 15) * 15 + 15);
+              if (due - now < 90_000) due.setMinutes(due.getMinutes() + 15);
+            }
+            return due;
+          }
+          
+          async function confirmNative(record, active) {
+            if (record.kind === 'launchd') {
+              const result = await run('launchctl', ['print', record.domain + '/' + record.label]);
+              assert.equal(result.code === 0, active, 'estado nativo de LaunchAgent');
+            } else if (record.kind === 'systemd') {
+              const result = await run('systemctl', ['--user', 'is-active', record.timer]);
+              assert.equal(result.code === 0, active, 'estado nativo del timer de systemd');
+            } else {
+              const result = await run('crontab', ['-l']);
+              if (active) success(result, 'lectura de crontab');
+              assert.equal(record.lines.every(line => result.stdout.split('\n').includes(line)), active, 'estado nativo en crontab');
+            }
+          }
+          
+          async function confirmSuccessfulNativeExit(record) {
+            const deadline = Date.now() + 10_000;
+            while (record.kind !== 'crontab') {
+              const result = record.kind === 'launchd'
+                ? await run('launchctl', ['print', record.domain + '/' + record.label])
+                : await run('systemctl', ['--user', 'show', record.unit + '.service', '--property=Result', '--property=ExecMainStatus']);
+              const output = success(result, 'estado final de la ejecución nativa');
+              const exited = record.kind === 'launchd'
+                ? /^\s*last exit code = 0\s*$/m.test(output)
+                : /^Result=success$/m.test(output) && /^ExecMainStatus=0$/m.test(output);
+              if (exited) return;
+              if (Date.now() >= deadline) throw new Error('El programador nativo no confirmó salida 0');
+              await delay(400);
+            }
+          }
+          
+          const fixture = await fs.mkdtemp(path.join(os.tmpdir(), 'mind-programador-datos-'));
+          const marker = path.join(fixture, markerName);
+          const historyFile = path.join(base, 'function-history-' + functionId + '.json');
+          const auditFile = path.join(base, 'auditoria.jsonl');
+          const cancel = new AbortController();
+          for (const signal of ['SIGINT', 'SIGTERM']) {
+            process.once(signal, () => cancel.abort(new Error('Prueba interrumpida: ' + signal)));
+          }
+          let installed = null;
+          try {
+            const session = await openSession({ layout, motorVersion: version.motor, observe: false });
+            let due;
+            try {
+              await session.start();
+              const folder = await session.motor.authorizeFolder(fixture);
+              await session.policy.set(folder.id, { encontrar: true, leer: true, escribir: true, organizar: true }, { channel: 'consola' });
+              await session.ensureIndex(folder.id);
+              const service = functionServiceFor(session);
+              due = nextDue();
+              const hora = [due.getHours(), due.getMinutes()].map(value => String(value).padStart(2, '0')).join(':');
+              await service.create(functionId, {
+                nombre: 'Prueba ficticia del programador nativo',
+                ejecutor: 'plantilla-texto',
+                parametros: { destino: { carpeta: folder.id, ruta: markerName }, plantilla: markerText },
+                activacion: { tipo: 'horario', frecuencia: 'diaria', hora },
+              });
+              const prepared = await service.prepareActivation(functionId);
+              const authorized = await service.authorize(functionId, {
+                generation: prepared.generation, fingerprint: prepared.fingerprint, channel: 'consola',
+              });
+              assert.equal(authorized.estado, 'activa');
+              assert.deepEqual(await service.due(), []);
+            } finally {
+              await session.close();
+            }
+            await confirmClosed();
+            assert.equal(await readText(marker), null);
+            assert.equal(await readJson(historyFile), null);
+            const install = await run('python3', ['-c', PTY, launcher]);
+            assert.equal(install.code, 0, 'instalación interactiva: ' + (install.stderr || install.stdout).trim().slice(-800));
+            assert.match(install.stdout, /Programador instalado/);
+            installed = await readJson(installationFile);
+            assert.equal(installed?.state, 'instalado');
+            const record = installed.record;
+            assert.equal(record.kind, native.disponible);
+            assert.deepEqual(record.command, { program: launcher, args: ['programadas'] });
+            const status = JSON.parse(success(await run(launcher, ['programador', 'estado']), 'programador instalado'));
+            assert.equal(status.instalado, true);
+            assert.equal(status.tipo, record.kind);
+            await confirmNative(record, true);
+            console.log(JSON.stringify({ etapa: 'instalado-esperando-disparo-nativo', programador: record.kind, vence: due.toISOString(), sesionMindCerrada: true }));
+          
+            const deadline = Date.now() + 18 * 60_000;
+            let history;
+            do {
+              cancel.signal.throwIfAborted();
+              history = await readJson(historyFile);
+              if (history?.entries?.length) break;
+              await delay(3_000, undefined, { signal: cancel.signal });
+            } while (Date.now() < deadline);
+            assert.ok(history?.entries?.length, 'El disparo natural no produjo historial en 18 minutos');
+            await confirmClosed();
+            await confirmSuccessfulNativeExit(record);
+            assert.deepEqual(await fs.readdir(fixture), [markerName]);
+            assert.equal(await readText(marker), markerText);
+            assert.equal(history.entries.length, 1, 'Un solo turno ejecutado');
+            const [entry] = history.entries;
+            assert.equal(entry.estado, 'completada', entry.codigo ?? undefined);
+            assert.equal(entry.origen, 'programada');
+            assert.equal(entry.programada, due.toISOString());
+            assert.ok(Date.parse(entry.fecha) >= due.getTime());
+            const events = (await fs.readFile(auditFile, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+            const execution = events.filter(item => item.evento === 'funcion-ejecutada' && item.funcion === functionId);
+            assert.equal(execution.length, 1);
+            assert.equal(execution[0].origen, 'programada');
+            assert.equal(execution[0].estado, 'completada');
+            assert.equal(execution[0].programada, entry.programada);
+            assert.equal((await readJson(manifestPath)).mindVersion, manifest.mindVersion);
+            console.log(JSON.stringify({ etapa: 'ejecutado', plataforma: target, programador: record.kind, version: version.mind, marcador: true, historial: entry.estado, auditoria: true, ejecuciones: 1, procesosRestantes: 0, vence: entry.programada, ejecutado: entry.fecha }));
+          } finally {
+            try {
+              installed ??= await readJson(installationFile);
+              if (installed) {
+                const output = success(await run(launcher, ['programador', 'desinstalar']), 'desinstalar programador');
+                assert.equal(JSON.parse(output).status, 'desinstalado');
+                assert.equal(await readJson(installationFile), null);
+                await confirmNative(installed.record, false);
+                const status = JSON.parse(success(await run(launcher, ['programador', 'estado']), 'estado después de retirar'));
+                assert.equal(status.instalado, false);
+                await confirmClosed();
+                console.log(JSON.stringify({ etapa: 'limpieza', programadorRetirado: true, procesosRestantes: 0 }));
+              }
+            } finally {
+              await fs.rm(marker, { force: true });
+              await fs.rmdir(fixture);
+            }
+          }
+          NODE
+          node "$MIND_TEST_ROOT/programador.mjs" "$MIND_TEST_ROOT/Mind"
+
