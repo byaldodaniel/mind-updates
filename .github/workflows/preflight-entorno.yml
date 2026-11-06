@@ -1,0 +1,86 @@
+name: Preflight de entorno Mind
+
+on:
+  push:
+    branches:
+      - codex/piloto-paridad
+    paths:
+      - .github/workflows/preflight-entorno.yml
+
+permissions: {}
+
+jobs:
+  macos:
+    name: ${{ matrix.nombre }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { nombre: macOS Apple Silicon, runner: macos-15, arch: arm64 }
+          - { nombre: macOS Intel, runner: macos-15-intel, arch: x86_64 }
+    env:
+      MIND_ESPERADA_ARQUITECTURA: ${{ matrix.arch }}
+    steps:
+      - name: Comprobar sesión gráfica y Gatekeeper
+        shell: bash
+        run: |
+          sw_vers
+          architecture="$(uname -m)"
+          printf 'Arquitectura: %s\n' "$architecture"
+          test "$architecture" = "$MIND_ESPERADA_ARQUITECTURA"
+          if launchctl print "gui/$(id -u)" >/dev/null 2>&1; then
+            echo 'Dominio launchctl GUI: presente'
+          else
+            echo 'Dominio launchctl GUI: ausente'
+          fi
+          for process in Finder WindowServer; do
+            if pgrep -x "$process" >/dev/null; then
+              printf '%s: presente\n' "$process"
+            else
+              printf '%s: ausente\n' "$process"
+            fi
+          done
+          spctl --status || true
+          python3 - <<'PY'
+          import pathlib
+          import subprocess
+          import tempfile
+
+          with tempfile.TemporaryDirectory(prefix='mind-pantalla-') as temporary:
+              capture = pathlib.Path(temporary) / 'pantalla.png'
+              try:
+                  result = subprocess.run(
+                      ['/usr/sbin/screencapture', '-x', str(capture)],
+                      capture_output=True,
+                      timeout=20,
+                  )
+                  if result.returncode == 0 and capture.is_file() and capture.stat().st_size > 0:
+                      with capture.open('rb') as image:
+                          is_png = image.read(8) == bytes.fromhex('89504e470d0a1a0a')
+                      print(f'Captura temporal: {"PNG válido" if is_png else "formato inesperado"}')
+                  else:
+                      print(f'Captura temporal: no disponible (código {result.returncode})')
+              except (OSError, subprocess.TimeoutExpired) as error:
+                  print(f'Captura temporal: no disponible ({type(error).__name__})')
+          PY
+
+  linux:
+    name: Ubuntu x64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Consultar cron y systemd de usuario
+        shell: bash
+        run: |
+          uname -sm
+          if command -v cron >/dev/null; then
+            printf 'cron: %s\n' "$(command -v cron)"
+            systemctl is-active cron.service || true
+          else
+            echo 'cron: ejecutable ausente'
+          fi
+          echo 'systemd de usuario:'
+          systemctl --user is-system-running || true
+          systemctl --user is-active default.target || true
