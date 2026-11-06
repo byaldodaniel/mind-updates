@@ -11,9 +11,9 @@ permissions: {}
 
 env:
   # Fijar los tres valores desde el inventario local del borrador temporal.
-  MIND_DRAFT_ID: ''
-  MIND_MATRIX_ASSET_ID: ''
-  MIND_MATRIX_SHA256: ''
+  MIND_DRAFT_ID: '436019600'
+  MIND_MATRIX_ASSET_ID: '715589846'
+  MIND_MATRIX_SHA256: 'db18d22b992a3d1928bafa223012604dc391e9c5675514afbe2d37ba9af89ba9'
 
 jobs:
   configurar:
@@ -144,11 +144,44 @@ jobs:
           console.log(`Archivos de ${env.MIND_PLATAFORMA} comprobados.`);
           NODE
 
+      - name: Preparar Claude Code 2.1.316 para probar MCP sin modelo
+        shell: bash
+        run: |
+          set -eu
+          prefix="$MIND_CANDIDATOS_DIR/claude-code"
+          log="$MIND_CANDIDATOS_DIR/npm.log"
+          if [ "$RUNNER_OS" = 'Windows' ]; then
+            bin="$(cygpath -u "$prefix")"
+            native_bin="$(cygpath -w "$prefix")"
+          else
+            bin="$prefix/bin"
+            native_bin="$bin"
+          fi
+          export PATH="$bin:$PATH"
+          export DISABLE_TELEMETRY=1 DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+          unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN
+          if npm install --global --prefix "$prefix" --cache "$MIND_CANDIDATOS_DIR/npm-cache" \
+              --no-audit --no-fund @anthropic-ai/claude-code@2.1.316 > "$log" 2>&1 && \
+              node --input-type=module -e '
+                import { spawnSync } from "node:child_process";
+                const options = { encoding: "utf8", timeout: 30_000, windowsHide: true };
+                const result = process.platform === "win32"
+                  ? spawnSync("claude --version", { ...options, shell: true })
+                  : spawnSync("claude", ["--version"], options);
+                if (result.status !== 0 || !result.stdout.includes("2.1.316")) process.exit(1);
+              ' >> "$log" 2>&1; then
+            printf '%s\n' "$native_bin" >> "$GITHUB_PATH"
+            echo 'MIND_CLAUDE_LISTO=1' >> "$GITHUB_ENV"
+          else
+            echo '::warning::Claude Code 2.1.316 no quedó disponible. Se conservan los demás casos; el caso de Claude Code queda pendiente.'
+          fi
+
       - name: Probar el paquete sin credenciales de GitHub
         shell: bash
         run: |
           set -eu
-          unset GH_TOKEN GITHUB_TOKEN
+          export DISABLE_TELEMETRY=1 DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+          unset GH_TOKEN GITHUB_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN
           python - "$MIND_CANDIDATOS_DIR" <<'PY'
           import pathlib, sys, zipfile
 
@@ -185,6 +218,7 @@ jobs:
             path.join(harness, 'scripts', 'probar-paquete.mjs'),
             path.join(root, row.paquete.name), path.join(root, row.actualizacion.name),
             row.paquete.sha256, row.actualizacion.sha256, reports,
+            ...(process.env.MIND_CLAUDE_LISTO === '1' ? ['--claude', 'claude'] : []),
           ], { cwd: harness, stdio: ['ignore', log, log] });
           fs.closeSync(log);
 
