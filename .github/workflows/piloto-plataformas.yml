@@ -1,49 +1,32 @@
-name: Piloto de plataformas Mind
+name: Prueba de lectura de borrador Mind
 
 on:
   push:
     branches:
       - codex/piloto-paridad
 
-permissions: {}
+permissions:
+  contents: read
 
 jobs:
-  verificar:
-    name: ${{ matrix.nombre }}
-    runs-on: ${{ matrix.runner }}
+  probar:
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { nombre: Windows x64, runner: windows-2025, sistema: Windows, arch: x64 }
-          - { nombre: Linux x64, runner: ubuntu-24.04, sistema: Linux, arch: x86_64 }
-          - { nombre: Linux ARM64, runner: ubuntu-24.04-arm, sistema: Linux, arch: aarch64 }
-          - { nombre: macOS Apple Silicon, runner: macos-15, sistema: Darwin, arch: arm64 }
-          - { nombre: macOS Intel, runner: macos-15-intel, sistema: Darwin, arch: x86_64 }
-    env:
-      MIND_ESPERADO_SISTEMA: ${{ matrix.sistema }}
-      MIND_ESPERADA_ARQUITECTURA: ${{ matrix.arch }}
     steps:
-      - name: Verificar Windows y su arquitectura
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
-          if ($env:RUNNER_OS -ne $env:MIND_ESPERADO_SISTEMA -or $architecture -ne $env:MIND_ESPERADA_ARQUITECTURA) {
-            throw "Entorno inesperado: $env:RUNNER_OS $architecture"
-          }
-          Write-Output "$env:RUNNER_OS $architecture"
-
-      - name: Verificar el sistema y su arquitectura
-        if: runner.os != 'Windows'
+      - name: Leer un asset ficticio por ID con permiso de lectura
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          system="$(uname -s)"
-          architecture="$(uname -m)"
-          if [ "$system" != "$MIND_ESPERADO_SISTEMA" ] || [ "$architecture" != "$MIND_ESPERADA_ARQUITECTURA" ]; then
-            printf 'Entorno inesperado: %s %s\n' "$system" "$architecture" >&2
-            exit 1
-          fi
-          printf '%s %s\n' "$system" "$architecture"
+          endpoint="repos/$GITHUB_REPOSITORY/releases/assets/715547249"
+          status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' "https://api.github.com/$endpoint")"
+          printf 'Acceso anónimo: %s\n' "$status"
+          case "$status" in
+            403|404) ;;
+            *) exit 1 ;;
+          esac
+          asset="$RUNNER_TEMP/prueba-acceso.txt"
+          gh api --method GET -H 'Accept: application/octet-stream' "$endpoint" > "$asset"
+          printf '%s  %s\n' '09eecfcef93152d39f882589de6464257c69e918c8821e2e683aac58cc9c41c6' "$asset" | sha256sum --check --status
+          printf 'Contenido y SHA-256 verificados con el token de solo lectura.\n'
