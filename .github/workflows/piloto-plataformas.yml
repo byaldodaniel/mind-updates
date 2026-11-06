@@ -5,15 +5,17 @@ on:
     branches:
       - codex/piloto-paridad
 
-permissions:
-  contents: read
+permissions: {}
 
 jobs:
   probar:
+    if: github.actor == 'byaldodaniel' && github.triggering_actor == 'byaldodaniel'
+    permissions:
+      contents: write
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Leer un asset ficticio por ID con permiso de lectura
+      - name: Leer un asset ficticio por ID con el token efímero del repositorio
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -29,4 +31,4 @@ jobs:
           asset="$RUNNER_TEMP/prueba-acceso.txt"
           gh api --method GET -H 'Accept: application/octet-stream' "$endpoint" > "$asset"
           printf '%s  %s\n' '09eecfcef93152d39f882589de6464257c69e918c8821e2e683aac58cc9c41c6' "$asset" | sha256sum --check --status
-          printf 'Contenido y SHA-256 verificados con el token de solo lectura.\n'
+          printf 'Contenido y SHA-256 verificados con el token efímero de contenido.\n'
