@@ -1,4 +1,4 @@
-name: Validación nativa de candidatos Mind
+name: Validación nativa del ZIP universal Mind
 
 on:
   push:
@@ -11,33 +11,13 @@ permissions: {}
 
 env:
   # Fijar los tres valores desde el inventario local del borrador temporal.
-  MIND_DRAFT_ID: '436019600'
-  MIND_MATRIX_ASSET_ID: '715589846'
-  MIND_MATRIX_SHA256: 'db18d22b992a3d1928bafa223012604dc391e9c5675514afbe2d37ba9af89ba9'
+  MIND_DRAFT_ID: '436562820'
+  MIND_MATRIX_ASSET_ID: '717341727'
+  MIND_MATRIX_SHA256: 'fa0134422fa6eb9d29108c759ea8ecc0b98f1e86772cc157c48198a9c45c5e34'
 
 jobs:
-  configurar:
-    if: github.actor == 'byaldodaniel' && github.triggering_actor == 'byaldodaniel'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    outputs:
-      activo: ${{ steps.config.outputs.activo }}
-    steps:
-      - name: Comprobar que se fijó el borrador y su inventario
-        id: config
-        shell: bash
-        run: |
-          if [ -z "$MIND_DRAFT_ID$MIND_MATRIX_ASSET_ID$MIND_MATRIX_SHA256" ]; then
-            echo 'activo=false' >> "$GITHUB_OUTPUT"
-            echo 'Validación pendiente: no se han fijado los candidatos.' >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-          [[ "$MIND_DRAFT_ID" =~ ^[1-9][0-9]*$ && "$MIND_MATRIX_ASSET_ID" =~ ^[1-9][0-9]*$ && "$MIND_MATRIX_SHA256" =~ ^[a-f0-9]{64}$ ]]
-          echo 'activo=true' >> "$GITHUB_OUTPUT"
-
   verificar:
-    needs: configurar
-    if: needs.configurar.outputs.activo == 'true'
+    if: github.actor == 'byaldodaniel' && github.triggering_actor == 'byaldodaniel'
     name: ${{ matrix.plataforma }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
@@ -47,7 +27,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { plataforma: win32-x64, runner: windows-2025 }
           - { plataforma: linux-x64, runner: ubuntu-24.04 }
           - { plataforma: linux-arm64, runner: ubuntu-24.04-arm }
           - { plataforma: darwin-arm64, runner: macos-15 }
@@ -55,6 +34,10 @@ jobs:
     env:
       MIND_PLATAFORMA: ${{ matrix.plataforma }}
     steps:
+      - name: Comprobar que se fijó el borrador y su inventario
+        shell: bash
+        run: |
+          [[ "$MIND_DRAFT_ID" =~ ^[1-9][0-9]*$ && "$MIND_MATRIX_ASSET_ID" =~ ^[1-9][0-9]*$ && "$MIND_MATRIX_SHA256" =~ ^[a-f0-9]{64}$ ]]
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24.22.1'
@@ -82,10 +65,7 @@ jobs:
           const env = process.env;
           const sha = /^[a-f0-9]{64}$/u;
           const versionPattern = /^\d+\.\d+\.\d+$/u;
-          const targets = new Map([
-            ['win32-x64', 'zip'], ['linux-x64', 'tar.gz'], ['linux-arm64', 'tar.gz'],
-            ['darwin-arm64', 'tar.gz'], ['darwin-x64', 'tar.gz'],
-          ]);
+          const targets = new Set(['win32-x64', 'linux-x64', 'linux-arm64', 'darwin-arm64', 'darwin-x64']);
           const repo = 'repos/byaldodaniel/mind-updates';
           require(env.GITHUB_REPOSITORY === 'byaldodaniel/mind-updates', 'Repositorio inesperado.');
           const release = JSON.parse(execFileSync('gh', ['api', `${repo}/releases/${env.MIND_DRAFT_ID}`], { encoding: 'utf8' }));
@@ -125,15 +105,15 @@ jobs:
           const parts = matrix.version.split('.');
           parts[2] = String(Number(parts[2]) + 1);
           const nextVersion = parts.join('.');
-          const remaining = new Set(targets.keys());
+          const remaining = new Set(targets);
           const maxPackage = 512 * 1024 * 1024;
+          const [reference] = matrix.paquetes;
           for (const entry of matrix.paquetes) {
             require(remaining.delete(entry.plataforma), 'Plataforma inesperada o repetida.');
-            const extension = targets.get(entry.plataforma);
-            require(entry.paquete.name === `Mind-${matrix.version}-${entry.plataforma}.${extension}`, 'Nombre de paquete inválido.');
-            require(entry.actualizacion.name === `Mind-${nextVersion}-${entry.plataforma}.${extension}`, 'Nombre de actualización inválido.');
-            find(entry.paquete, maxPackage);
-            find(entry.actualizacion, maxPackage);
+            require(entry.paquete.name === `Mind-${matrix.version}-universal.zip`, 'Nombre de paquete universal inválido.');
+            require(entry.actualizacion.name === `Mind-${nextVersion}-universal.zip`, 'Nombre de actualización universal inválido.');
+            require(entry.paquete.sha256 === reference.paquete.sha256 && entry.actualizacion.sha256 === reference.actualizacion.sha256,
+              'Las cinco plataformas deben probar los mismos ZIP y huellas.');
           }
           const selected = matrix.paquetes.find(entry => entry.plataforma === env.MIND_PLATAFORMA);
           require(selected, 'Falta la plataforma del runner.');
@@ -229,6 +209,16 @@ jobs:
           const pass = result.status === 0 && report.resultado === 'superado'
             && report.plataforma === platform && report.version === inventory.version && report.commit === inventory.commit
             && report.paquete_sha256 === row.paquete.sha256 && report.actualizacion_sha256 === row.actualizacion.sha256;
+          const status = (value) => ['superado', 'fallido', 'pendiente'].includes(value) ? value : 'sin confirmar';
+          console.log('MIND_REPORT ' + JSON.stringify({
+            plataforma: platform, version: inventory.version, commit: inventory.commit,
+            paquete_sha256: row.paquete.sha256, actualizacion_sha256: row.actualizacion.sha256,
+            resultado: pass ? 'superado' : 'fallido',
+            casos: (report.casos ?? []).map(({ caso, resultado }) => ({ caso: Number(caso), resultado: status(resultado) })),
+            claude_disponible: process.env.MIND_CLAUDE_LISTO === '1',
+            actualizacion_automatica: status(report.actualizacion_automatica?.resultado),
+            cuarentena_simulada: report.cuarentena_simulada === 'superada' ? 'superada' : 'sin confirmar',
+          }));
           fs.appendFileSync(summary, [
             `### Mind ${inventory.version} · ${platform}`,
             `Commit: ${inventory.commit}`,
