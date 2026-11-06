@@ -1,34 +1,210 @@
-name: Prueba de lectura de borrador Mind
+name: Validación nativa de candidatos Mind
 
 on:
   push:
     branches:
       - codex/piloto-paridad
+    paths:
+      - .github/workflows/piloto-plataformas.yml
 
 permissions: {}
 
+env:
+  # Fijar los tres valores desde el inventario local del borrador temporal.
+  MIND_DRAFT_ID: ''
+  MIND_MATRIX_ASSET_ID: ''
+  MIND_MATRIX_SHA256: ''
+
 jobs:
-  probar:
+  configurar:
     if: github.actor == 'byaldodaniel' && github.triggering_actor == 'byaldodaniel'
-    permissions:
-      contents: write
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    outputs:
+      activo: ${{ steps.config.outputs.activo }}
     steps:
-      - name: Leer un asset ficticio por ID con el token efímero del repositorio
+      - name: Comprobar que se fijó el borrador y su inventario
+        id: config
+        shell: bash
+        run: |
+          if [ -z "$MIND_DRAFT_ID$MIND_MATRIX_ASSET_ID$MIND_MATRIX_SHA256" ]; then
+            echo 'activo=false' >> "$GITHUB_OUTPUT"
+            echo 'Validación pendiente: no se han fijado los candidatos.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          [[ "$MIND_DRAFT_ID" =~ ^[1-9][0-9]*$ && "$MIND_MATRIX_ASSET_ID" =~ ^[1-9][0-9]*$ && "$MIND_MATRIX_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          echo 'activo=true' >> "$GITHUB_OUTPUT"
+
+  verificar:
+    needs: configurar
+    if: needs.configurar.outputs.activo == 'true'
+    name: ${{ matrix.plataforma }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { plataforma: win32-x64, runner: windows-2025 }
+          - { plataforma: linux-x64, runner: ubuntu-24.04 }
+          - { plataforma: linux-arm64, runner: ubuntu-24.04-arm }
+          - { plataforma: darwin-arm64, runner: macos-15 }
+          - { plataforma: darwin-x64, runner: macos-15-intel }
+    env:
+      MIND_PLATAFORMA: ${{ matrix.plataforma }}
+    steps:
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.22.1'
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Descargar exclusivamente los archivos verificados del borrador
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_PROMPT_DISABLED: '1'
+        run: |
+          node --input-type=module <<'NODE'
+          import { execFileSync, spawn } from 'node:child_process';
+          import { createHash } from 'node:crypto';
+          import { createReadStream, createWriteStream } from 'node:fs';
+          import fs from 'node:fs/promises';
+          import path from 'node:path';
+          import { pipeline } from 'node:stream/promises';
+
+          const require = (condition, message) => {
+            if (!condition) throw new Error(message);
+          };
+          const env = process.env;
+          const sha = /^[a-f0-9]{64}$/u;
+          const versionPattern = /^\d+\.\d+\.\d+$/u;
+          const targets = new Map([
+            ['win32-x64', 'zip'], ['linux-x64', 'tar.gz'], ['linux-arm64', 'tar.gz'],
+            ['darwin-arm64', 'tar.gz'], ['darwin-x64', 'tar.gz'],
+          ]);
+          const repo = 'repos/byaldodaniel/mind-updates';
+          require(env.GITHUB_REPOSITORY === 'byaldodaniel/mind-updates', 'Repositorio inesperado.');
+          const release = JSON.parse(execFileSync('gh', ['api', `${repo}/releases/${env.MIND_DRAFT_ID}`], { encoding: 'utf8' }));
+          require(release.draft && release.tag_name.startsWith('codex-validacion-'), 'Solo se admiten borradores temporales de validación.');
+          const assets = new Map(release.assets.map(asset => [asset.name, asset]));
+          require(assets.size === release.assets.length, 'Nombres de assets repetidos.');
+          const root = await fs.mkdtemp(path.join(env.RUNNER_TEMP, 'mind-candidatos-'));
+          const find = ({ name, sha256 }, maximum) => {
+            require(sha.test(sha256), 'Huella SHA-256 inválida.');
+            const asset = assets.get(name);
+            require(asset?.state === 'uploaded' && asset.digest === `sha256:${sha256}`, 'El inventario y GitHub difieren.');
+            require(Number.isSafeInteger(asset.size) && asset.size > 0 && asset.size <= maximum, 'Tamaño de asset inválido.');
+            return asset;
+          };
+          async function download(reference, maximum) {
+            const asset = find(reference, maximum);
+            const file = path.join(root, reference.name);
+            const child = spawn('gh', ['api', '--method', 'GET', '-H', 'Accept: application/octet-stream',
+              `${repo}/releases/assets/${asset.id}`], { stdio: ['ignore', 'pipe', 'inherit'] });
+            const finished = new Promise((resolve, reject) => {
+              child.on('error', reject);
+              child.on('close', code => code === 0 ? resolve() : reject(new Error('Falló la descarga del borrador.')));
+            });
+            await Promise.all([finished, pipeline(child.stdout, createWriteStream(file, { flags: 'wx' }))]);
+            const hash = createHash('sha256');
+            for await (const chunk of createReadStream(file)) hash.update(chunk);
+            require((await fs.stat(file)).size === asset.size && hash.digest('hex') === reference.sha256, 'El asset descargado no coincide.');
+            return file;
+          }
+
+          const matrixAsset = assets.get('matriz.json');
+          require(String(matrixAsset?.id) === env.MIND_MATRIX_ASSET_ID, 'El identificador del inventario no coincide.');
+          const matrixFile = await download({ name: 'matriz.json', sha256: env.MIND_MATRIX_SHA256 }, 128 * 1024);
+          const matrix = JSON.parse(await fs.readFile(matrixFile, 'utf8'));
+          require(versionPattern.test(matrix.version) && /^[a-f0-9]{40}$/u.test(matrix.commit), 'Versión o commit inválido.');
+          require(matrix.harness?.name === 'pruebas-mind.zip' && matrix.paquetes?.length === targets.size, 'Inventario incompleto.');
+          const parts = matrix.version.split('.');
+          parts[2] = String(Number(parts[2]) + 1);
+          const nextVersion = parts.join('.');
+          const remaining = new Set(targets.keys());
+          const maxPackage = 512 * 1024 * 1024;
+          for (const entry of matrix.paquetes) {
+            require(remaining.delete(entry.plataforma), 'Plataforma inesperada o repetida.');
+            const extension = targets.get(entry.plataforma);
+            require(entry.paquete.name === `Mind-${matrix.version}-${entry.plataforma}.${extension}`, 'Nombre de paquete inválido.');
+            require(entry.actualizacion.name === `Mind-${nextVersion}-${entry.plataforma}.${extension}`, 'Nombre de actualización inválido.');
+            find(entry.paquete, maxPackage);
+            find(entry.actualizacion, maxPackage);
+          }
+          const selected = matrix.paquetes.find(entry => entry.plataforma === env.MIND_PLATAFORMA);
+          require(selected, 'Falta la plataforma del runner.');
+          await download(matrix.harness, 16 * 1024 * 1024);
+          await download(selected.paquete, maxPackage);
+          await download(selected.actualizacion, maxPackage);
+          await fs.appendFile(env.GITHUB_ENV, `MIND_CANDIDATOS_DIR=${root.split(path.sep).join('/')}\n`);
+          console.log(`Archivos de ${env.MIND_PLATAFORMA} comprobados.`);
+          NODE
+
+      - name: Probar el paquete sin credenciales de GitHub
+        shell: bash
         run: |
           set -eu
-          endpoint="repos/$GITHUB_REPOSITORY/releases/assets/715547249"
-          status="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' "https://api.github.com/$endpoint")"
-          printf 'Acceso anónimo: %s\n' "$status"
-          case "$status" in
-            403|404) ;;
-            *) exit 1 ;;
-          esac
-          asset="$RUNNER_TEMP/prueba-acceso.txt"
-          gh api --method GET -H 'Accept: application/octet-stream' "$endpoint" > "$asset"
-          printf '%s  %s\n' '09eecfcef93152d39f882589de6464257c69e918c8821e2e683aac58cc9c41c6' "$asset" | sha256sum --check --status
-          printf 'Contenido y SHA-256 verificados con el token efímero de contenido.\n'
+          unset GH_TOKEN GITHUB_TOKEN
+          python - "$MIND_CANDIDATOS_DIR" <<'PY'
+          import pathlib, sys, zipfile
+
+          root = pathlib.Path(sys.argv[1])
+          allowed = {
+              'package.json', 'test/helpers/mcp-client.js', 'scripts/probar-paquete.mjs',
+              'scripts/producto-12-casos.mjs', 'scripts/producto-actualizacion-automatica.mjs',
+              'scripts/producto-cuarentena-macos.mjs',
+          }
+          with zipfile.ZipFile(root / 'pruebas-mind.zip') as archive:
+              for item in archive.infolist():
+                  parts = pathlib.PurePosixPath(item.filename).parts
+                  if not parts or item.filename.startswith('/') or '\\' in item.filename or '..' in parts or ':' in item.filename:
+                      raise SystemExit('Ruta inesperada en la batería de pruebas.')
+                  if item.is_dir() and item.filename in ('src/', 'test/', 'test/helpers/', 'scripts/'):
+                      continue
+                  if item.filename not in allowed and parts[0] != 'src':
+                      raise SystemExit('Archivo inesperado en la batería de pruebas.')
+              archive.extractall(root / 'harness')
+          PY
+
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { spawnSync } from 'node:child_process';
+
+          const { MIND_CANDIDATOS_DIR: root, MIND_PLATAFORMA: platform, GITHUB_STEP_SUMMARY: summary } = process.env;
+          const inventory = JSON.parse(fs.readFileSync(path.join(root, 'matriz.json'), 'utf8'));
+          const row = inventory.paquetes.find(entry => entry.plataforma === platform);
+          const harness = path.join(root, 'harness');
+          const reports = path.join(root, 'informes');
+          const log = fs.openSync(path.join(root, 'prueba-local.log'), 'w');
+          const result = spawnSync(process.execPath, [
+            path.join(harness, 'scripts', 'probar-paquete.mjs'),
+            path.join(root, row.paquete.name), path.join(root, row.actualizacion.name),
+            row.paquete.sha256, row.actualizacion.sha256, reports,
+          ], { cwd: harness, stdio: ['ignore', log, log] });
+          fs.closeSync(log);
+
+          const file = path.join(reports, `informe-${platform}.json`);
+          if (!fs.existsSync(file)) throw new Error('La prueba no produjo un informe.');
+          const report = JSON.parse(fs.readFileSync(file, 'utf8'));
+          const count = status => report.casos?.filter(entry => entry.resultado === status).length ?? 0;
+          const pass = result.status === 0 && report.resultado === 'superado'
+            && report.plataforma === platform && report.version === inventory.version && report.commit === inventory.commit
+            && report.paquete_sha256 === row.paquete.sha256 && report.actualizacion_sha256 === row.actualizacion.sha256;
+          fs.appendFileSync(summary, [
+            `### Mind ${inventory.version} · ${platform}`,
+            `Commit: ${inventory.commit}`,
+            `Paquete SHA-256: ${row.paquete.sha256}`,
+            `Actualización SHA-256: ${row.actualizacion.sha256}`,
+            `Casos: ${count('superado')} superados, ${count('fallido')} fallidos, ${count('pendiente')} pendientes`,
+            `Actualización de ensayo: ${report.actualizacion_automatica?.resultado === 'superado' ? 'superada' : 'sin confirmar'}`,
+            ...(platform.startsWith('darwin-') ? [`Cuarentena simulada: ${report.cuarentena_simulada === 'superada' ? 'superada' : 'sin confirmar'}`] : []),
+            `Resultado: ${pass ? 'superado' : 'fallido'}`,
+            '',
+          ].join('\n'));
+          if (!pass) throw new Error('La validación no alcanzó todos los requisitos.');
+          NODE
