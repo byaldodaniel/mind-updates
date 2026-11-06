@@ -1,0 +1,261 @@
+name: Primera apertura Mac de Mind 1.0.2
+
+on:
+  push:
+    branches:
+      - codex/piloto-paridad
+    paths:
+      - .github/workflows/piloto-apertura-mac.yml
+
+permissions: {}
+
+jobs:
+  primera-apertura:
+    if: github.actor == 'byaldodaniel' && github.triggering_actor == 'byaldodaniel'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 6
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-15, arch: arm64, filename: Mind-1.0.2-darwin-arm64.tar.gz, id: '715574386', bytes: '65742327', sha256: '351afc2e75fb192d3dd01328ce91d4d01275a7a17cdf7935b51b20b5dc8a7042' }
+          - { runner: macos-15-intel, arch: x86_64, filename: Mind-1.0.2-darwin-x64.tar.gz, id: '715574397', bytes: '66507780', sha256: '9c1b35103d301cdd759c46393e40c86375fe681b277d825d5daf1422d919a897' }
+    env:
+      ASSET: ${{ matrix.filename }}
+      EXPECTED: ${{ matrix.sha256 }}
+      EXPECTED_BYTES: ${{ matrix.bytes }}
+      EXPECTED_ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Obtener solo el candidato de este destino desde el borrador
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ID: '436019600'
+          ASSET_ID: ${{ matrix.id }}
+        run: |
+          set -euo pipefail
+          umask 077
+          private="$RUNNER_TEMP/mind-gui-private"
+          mkdir -m 700 "$private"
+          mkdir "$RUNNER_TEMP/mind-gui-evidence"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" > "$private/release.json"
+          jq -e --argjson id "$ASSET_ID" --arg name "$ASSET" --arg hash "$EXPECTED" \
+            '.draft == true and .tag_name == "codex-validacion-1.0.2-1f2c6d9" and
+             ([.assets[] | select(.id == $id and .name == $name and .digest == ("sha256:" + $hash))] | length == 1)' \
+            "$private/release.json" >/dev/null
+          if ! curl --silent --fail --location --max-redirs 3 --max-time 90 \
+            --proto '=https' --proto-redir '=https' \
+            -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/octet-stream' \
+            -D "$private/headers" -o "$private/$ASSET" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/assets/$ASSET_ID"; then
+            printf 'No se pudo descargar el candidato del borrador.\n' >&2
+            exit 1
+          fi
+          printf '%s  %s\n' "$EXPECTED" "$private/$ASSET" | shasum -a 256 -c - >/dev/null
+          python3 - "$private" <<'PY'
+          from pathlib import Path
+          from sys import argv
+          from urllib.parse import urlsplit
+
+          folder = Path(argv[1])
+          for line in (folder / 'headers').read_text(encoding='iso-8859-1').splitlines():
+              if line.lower().startswith('location:'):
+                  value = line.split(':', 1)[1].strip()
+                  url = urlsplit(value)
+                  if (url.scheme == 'https' and url.hostname in {
+                      'release-assets.githubusercontent.com', 'objects.githubusercontent.com',
+                  } and not url.username and not url.password and url.query):
+                      (folder / 'redirect').write_text(value, encoding='ascii')
+                      break
+          PY
+          rm "$private/headers" "$private/release.json"
+          printf 'Activo exacto del borrador verificado por SHA-256.\n'
+
+      - name: Descargar con Safari y observar la primera apertura de Finder
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          private="$RUNNER_TEMP/mind-gui-private"
+          evidence="$RUNNER_TEMP/mind-gui-evidence"
+          facts="$evidence/observaciones.txt"
+          exec > >(tee -a "$facts") 2>&1
+
+          sw_vers
+          [[ "$(uname -m)" == "$EXPECTED_ARCH" ]]
+          launchctl print "gui/$(id -u)" >/dev/null
+          pgrep -x WindowServer >/dev/null
+          pgrep -x Finder >/dev/null
+          spctl --status 2>&1 | grep -Fx 'assessments enabled'
+          printf 'SHA256=%s\n' "$EXPECTED"
+
+          cat > "$private/serve.py" <<'PY'
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from pathlib import Path
+          from shutil import copyfileobj
+          from sys import argv
+
+          folder = Path(argv[1])
+          asset = folder / argv[2]
+
+          class Handler(BaseHTTPRequestHandler):
+              def log_message(self, *_):
+                  pass
+
+              def do_GET(self):
+                  if self.path == '/candidato':
+                      self.send_response(200)
+                      self.send_header('Content-Type', 'application/octet-stream')
+                      self.send_header('Content-Disposition', f'attachment; filename="{asset.name}"')
+                      self.send_header('Content-Length', str(asset.stat().st_size))
+                      self.end_headers()
+                      with asset.open('rb') as source:
+                          copyfileobj(source, self.wfile)
+                  elif self.path == '/respaldo' and (folder / 'redirect').is_file():
+                      self.send_response(302)
+                      self.send_header('Location', (folder / 'redirect').read_text(encoding='ascii'))
+                      self.send_header('Cache-Control', 'no-store')
+                      self.end_headers()
+                  else:
+                      self.send_error(404)
+
+          with ThreadingHTTPServer(('127.0.0.1', 0), Handler) as server:
+              (folder / 'port').write_text(str(server.server_port), encoding='ascii')
+              server.serve_forever()
+          PY
+          python3 "$private/serve.py" "$private" "$ASSET" >/dev/null 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          for (( i = 0; i < 10; i++ )); do
+            if [[ -s "$private/port" ]]; then break; fi
+            sleep 1
+          done
+          [[ -s "$private/port" ]]
+          port="$(cat "$private/port")"
+
+          # Conserva el archivo original que descarga Safari para comprobar su huella y cuarentena.
+          previous_autoopen="$(defaults read com.apple.Safari AutoOpenSafeDownloads 2>/dev/null || true)"
+          cleanup() {
+            kill "$server" 2>/dev/null || true
+            if [[ "$previous_autoopen" == 0 || "$previous_autoopen" == 1 ]]; then
+              defaults write com.apple.Safari AutoOpenSafeDownloads -bool "$previous_autoopen" || true
+            else
+              defaults delete com.apple.Safari AutoOpenSafeDownloads 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+          defaults write com.apple.Safari AutoOpenSafeDownloads -bool false 2>/dev/null || true
+          archive="$HOME/Downloads/$ASSET"
+          product="$HOME/Downloads/Mind"
+          [[ ! -e "$archive" && ! -e "$product" ]]
+          has_quarantine() { /usr/bin/xattr -p com.apple.quarantine "$1" >/dev/null 2>&1; }
+          browser_download() {
+            /usr/bin/open -a Safari "http://127.0.0.1:$port/$1" >/dev/null 2>&1 || return 1
+            for (( i = 0; i < 55; i++ )); do
+              if [[ -f "$archive" ]] && [[ "$(stat -f %z "$archive")" == "$EXPECTED_BYTES" ]]; then return 0; fi
+              sleep 1
+            done
+            return 1
+          }
+
+          method=loopback
+          if ! browser_download candidato || ! has_quarantine "$archive"; then
+            printf 'Safari no dejó un archivo completo con cuarentena en la prueba de loopback.\n'
+            if [[ -e "$archive" ]]; then mv "$archive" "$private/primer-intento.tar.gz"; fi
+            method=redirect-https
+            if [[ ! -s "$private/redirect" ]] || ! browser_download respaldo || ! has_quarantine "$archive"; then
+              printf 'resultado=no_verificado; motivo=Safari no dejó el archivo completo con cuarentena natural.\n'
+              exit 1
+            fi
+          fi
+          printf '%s  %s\n' "$EXPECTED" "$archive" | shasum -a 256 -c - >/dev/null
+          printf 'descarga=safari; transporte=%s; huella=coincide; cuarentena_archivo=presente\n' "$method"
+
+          # Cierra Safari antes de guardar evidencia: podría mostrar una URL de descarga efímera.
+          pkill -TERM -x Safari >/dev/null 2>&1 || true
+          for (( i = 0; i < 10; i++ )); do
+            if ! pgrep -x Safari >/dev/null; then break; fi
+            sleep 1
+          done
+          if pgrep -x Safari >/dev/null; then
+            printf 'resultado=no_verificado; motivo=Safari sigue abierto; no se captura la sesión.\n'
+            exit 1
+          fi
+
+          open_finder() {
+            osascript - "$1" <<'APPLESCRIPT'
+          on run argv
+            with timeout of 8 seconds
+              set target to POSIX file (item 1 of argv) as alias
+              tell application id "com.apple.finder"
+                activate
+                open target
+              end tell
+            end timeout
+          end run
+          APPLESCRIPT
+          }
+          open_finder "$archive" >/dev/null 2>&1 &
+          unpack=$!
+          for (( i = 0; i < 45; i++ )); do
+            if [[ -f "$product/mind-producto.json" && -f "$product/Autorizar Mind.command" ]]; then break; fi
+            sleep 1
+          done
+          wait "$unpack" || true
+          if [[ ! -f "$product/mind-producto.json" || ! -f "$product/Autorizar Mind.command" ]]; then
+            printf 'resultado=no_verificado; motivo=Finder no completó la extracción.\n'
+            exit 1
+          fi
+          printf 'extraccion=Finder; '
+          if has_quarantine "$product/Autorizar Mind.command"; then
+            printf 'cuarentena_iniciador=presente\n'
+          else
+            printf 'resultado=no_verificado; motivo=el iniciador extraído no tiene cuarentena natural.\n'
+            exit 1
+          fi
+          if has_quarantine "$product/Runtime/node/bin/node"; then printf 'cuarentena_runtime=presente\n'; fi
+
+          started="$(date '+%Y-%m-%d %H:%M:%S')"
+          open_finder "$product/Autorizar Mind.command" >/dev/null 2>&1 &
+          first_launch=$!
+          cat > "$private/window.js" <<'JXA'
+          ObjC.import('CoreGraphics');
+          function run() {
+            const windows = ObjC.deepUnwrap($.CGWindowListCopyWindowInfo(17, 0));
+            for (const owner of ['CoreServicesUIAgent', 'Terminal']) {
+              const window = windows.find(item => item.kCGWindowOwnerName === owner
+                && item.kCGWindowBounds?.Width >= 120 && item.kCGWindowBounds?.Height >= 75);
+              if (window) return String(window.kCGWindowNumber);
+            }
+            return '';
+          }
+          JXA
+          for seconds in 1 3 6; do
+            sleep "$seconds"
+            window_id="$(osascript -l JavaScript "$private/window.js" 2>/dev/null || true)"
+            if [[ "$window_id" =~ ^[1-9][0-9]*$ ]]; then
+              /usr/sbin/screencapture -x -l "$window_id" "$evidence/primera-apertura-$seconds.png" >/dev/null 2>&1 || true
+            fi
+          done
+          wait "$first_launch" || true
+          matches="$(/usr/bin/log show --start "$started" --info --style compact \
+            --predicate 'process == "syspolicyd" OR process == "amfid"' 2>/dev/null \
+            | grep -Eic 'Autorizar Mind|Gatekeeper|assessment|ticket not available|quarantine' || true)"
+          printf 'Eventos de política coincidentes: %s\n' "${matches:-0}"
+
+          if ! compgen -G "$evidence/primera-apertura-*.png" >/dev/null; then
+            printf 'resultado=no_verificado; motivo=el runner no entregó capturas.\n'
+            exit 1
+          fi
+          printf 'resultado=requiere_revision_visual; abrir capturas para confirmar el aviso o el texto de Mind.\n'
+
+      - name: Conservar únicamente evidencia de prueba
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: apertura-mac-${{ matrix.arch }}
+          path: ${{ runner.temp }}/mind-gui-evidence/
+          retention-days: 1
+          if-no-files-found: warn
